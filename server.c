@@ -77,6 +77,15 @@ typedef union
 // Creates a UDP-ready socket at the specified port number
 int open_tftp_listening_socket(int port);
 
+// Sends an error message to the 
+void send_error_packet(int err_num, char* err_msg, struct sockaddr_in* client_addr, socklen_t* addrlen);
+
+// Sends a specified file to the client 
+void send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen);
+
+// Searches the working directory for the specified filename
+int search_for_file(char *filename);
+
 // Parses the request header, builds the info string to print to the 
 // command line, sends error response back to client denoting that the 
 // file was not found.
@@ -165,6 +174,50 @@ int open_tftp_listening_socket(int port)
 	return sockfd;
 }
 
+void send_error_packet(int err_num, char* err_msg, struct sockaddr_in* client_addr, socklen_t* addrlen)
+{
+	// creating new packet_t to hold error message
+	packet_t resp;
+
+	// set the opcode to 5 (for error)
+	resp.opcode = htons(5);
+
+	// set the error code
+	resp.error_t.error_code = htons(err_num);
+
+	// add the error message 
+	strcpy((char*)resp.error_t.error_msg,err_msg); 
+
+	// now need to open socket to connect back to client 
+	int cli_sock = socket(AF_INET,SOCK_DGRAM,0);
+	if (cli_sock<0){  printf("ERROR: Could not create client socket.\n");  }
+
+	// setting the options for the socket (socket timeout)
+	struct timeval tv;
+	tv.tv_sec = 5;
+	tv.tv_usec = 0;
+	int did_set = setsockopt(cli_sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
+	if (did_set<0){  printf("ERROR: Could not set socket options.\n");  }
+
+	// send the error response back to client
+	int did_send = sendto(cli_sock,&resp,strlen((char*)resp.error_t.error_msg)+5,0,(SA*)client_addr,*addrlen);
+	if (did_send<0){  printf("ERROR: Could not send error message to client.\n");  }
+
+	// close the client socket connection 
+	close(cli_sock);
+}
+
+void send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen)
+{
+	// not yet implemented, send error message 
+	send_error_packet(0,"Not Yet Implemented",client_addr,addrlen);
+}
+
+int search_for_file(char* filename)
+{
+	return 0;
+}
+
 void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, socklen_t* addrlen)
 {
 	// string to print out packet details
@@ -197,32 +250,30 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 	sprintf(print_str,"%s %s %s from %s:%s\n",req_type,filename,mode,ip_address,port_num);
 	printf("%s",print_str); // print out request info 
 
-	// now need to send the error code back to client...
+	// if the request is RRQ
+	if (strcmp(req_type,"RRQ")==0)
+	{
+		// check if the requested file exists
+		int f_exists = search_for_file(filename);
 
-	// creating new packet_t to hold error message
-	packet_t resp;
+		// if the requested file is not in the directory
+		if (f_exists==0)
+		{
+			// send the error code back to client
+			send_error_packet(1,"File Not Found",client_addr,addrlen);
+		}
 
-	// set the opcode to 5 (for error)
-	resp.opcode = htons(5);
+		// proceed to begin copying the file back to the client
+		else
+		{
+			send_file(filename,client_addr,addrlen);
+		}
+	}
 
-	// temporary file not found error number
-	resp.error_t.error_code = 0;
-
-	// add the error message 
-	strcpy(resp.error_t.error_msg,"File Not Found"); 
-
-	// now need to open socket to connect back to client 
-	int cli_sock = socket(AF_INET,SOCK_DGRAM,0);
-	if (cli_sock<0){  printf("ERROR: Could not create client socket.\n");  }
-
-	// setting the options for the socket (socket timeout)
-	struct timeval tv;
-	tv.tv_sec = 5;
-	tv.tv_usec = 0;
-	int did_set = setsockopt(cli_sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
-	if (did_set<0){  printf("ERROR: Could not set socket options.\n");  }
-
-	// send the error response back to client
-	int did_send = sendto(cli_sock,&resp,strlen(resp.error_t.error_msg)+5,0,(SA*)client_addr,*addrlen);
-	if (did_send<0){  printf("ERROR: Could not send error message to client.\n");  }
+	// if the request is WRQ
+	else
+	{
+		// have not covered this yet
+		send_error_packet(0,"Not Yet Implemented",client_addr,addrlen);
+	}
 }
