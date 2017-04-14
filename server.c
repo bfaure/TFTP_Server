@@ -34,7 +34,9 @@ command line and sends "Error 0: File Not Found" message back to clients.
 typedef struct sockaddr SA;
 typedef socklen_t SLT;
 
-// holds all the different likely structures for the received packets
+// Holds the different possible combinations of data structures which could make
+// up the packet contents. Used to aid in construction of sent packets and deconstruction
+// of contents in received packets.
 typedef union 
 {
 	// just opcode in packet  
@@ -72,11 +74,12 @@ typedef union
 
 } packet_t;
 
+// Creates a UDP-ready socket at the specified port number
+int open_tftp_listening_socket(int port);
 
-// creates a listening UDP socket at specified port number 
-int open_tftp_listening_socket(int port)
-
-// basic printing/returning of error messages to client
+// Parses the request header, builds the info string to print to the 
+// command line, sends error response back to client denoting that the 
+// file was not found.
 void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, socklen_t* addrlen);
 
 int main(int argc, char ** argv)
