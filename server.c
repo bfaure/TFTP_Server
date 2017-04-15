@@ -88,7 +88,7 @@ void send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t *da
 int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen, char* enc_mode);
 
 // Waits for an ACK message from client 
-int wait_for_ack(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen);
+int get_client_resp(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
 // Searches the working directory for the specified filename
 int search_for_file(char *filename);
@@ -243,10 +243,9 @@ void send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t* da
 	if (did_send<0){  printf("ERROR: Could not send error message to client.\n");  }
 }
 
-int wait_for_ack(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen)
+int get_client_resp(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen)
 {
 	int n = recvfrom(cli_sock,recv_packet,sizeof(*recv_packet),0,(SA*)client_addr,addrlen);
-	if (n<0){  printf("ERROR: Could not receive message from client.\n");  }
 	return n;
 }
 
@@ -288,21 +287,51 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 			return -1;
 		}
 
-		// send the data segment to the client 
-		send_data_packet(cli_sock,block_num,n,buf,client_addr,addrlen);
+		// track the number of attempted sends
+		int num_attempts = 0;
 
-		// wait until we get the correct ACK response
+		// try sending the packet
 		while(1)
 		{
+			// send the data segment to the client 
+			send_data_packet(cli_sock,block_num,n,buf,client_addr,addrlen);
+			num_attempts++;
+		
 			// wait for the ack message 
-			wait_for_ack(cli_sock,&recv_packet,client_addr,addrlen);
+			int did_ack = get_client_resp(cli_sock,&recv_packet,client_addr,addrlen);
 
-			// get the response block number
-			//int recv_block_num = ntohs(recv_packet.ack_t.block_num);
-
-			// get the response opcode
-			//int recv_opcode = ntohs(recv_packet.opcode);
-			break;
+			// if we got a response
+			if (did_ack>0)
+			{  
+				// check if the received packet was an ACK
+				if (ntohs(recv_packet.opcode)==4)
+				{
+					// check if the received block number was correct
+					if (ntohs(recv_packet.ack_t.block_num)==block_num)
+					{
+						// go on to the next packet (or exit if transfer complete)
+						break;
+					}
+				}
+				// check if the received packet was an ERROR
+				if (ntohs(recv_packet.opcode)==5)
+				{
+					// terminate execution upon receiving ERROR message
+					close(cli_sock);
+					fclose(file_ptr);
+					printf("NOTICE: Transfer canceled by client.\n");
+					return -1;
+				}
+			}
+			// if exceeded the maximum number of attempts 
+			if (num_attempts>=2)
+			{
+				// terminate execution 
+				close(cli_sock);
+				fclose(file_ptr);
+				printf("NOTICE: Client stopped responding, transfer canceled.\n");
+				return -1;
+			}
 		}
 
 		// increment the block number 
@@ -311,14 +340,12 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 		// if we are at the end of the file, exit the loop
 		if (n<512){  break;  }
 
-		//sleep(0.9); // TESTING
+		sleep(2); // TESTING
 	}
 	// close the client socket connection
 	close(cli_sock);
-
 	// close the local file we transferred
 	fclose(file_ptr);
-	
 	return block_num-1;
 }
 
@@ -380,14 +407,15 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 		{
 			// send the error code back to client
 			send_error_packet(1,"File Not Found",client_addr,addrlen);
-			printf("\tCould not locate requested file!\n");
+			printf("\tCould not locate file (%s)\n",filename);
 		}
 
 		// proceed to begin copying the file back to the client
 		else
 		{
 			int num_blocks = send_file(filename,client_addr,addrlen,mode);
-			printf("\tSent requested file to client (%d blocks).\n",num_blocks);
+			if (num_blocks<0){  return;  }
+			printf("\tSent %s file to client (%d blocks).\n",filename,num_blocks);
 		}
 	}
 
