@@ -311,7 +311,7 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 		// if we are at the end of the file, exit the loop
 		if (n<512){  break;  }
 
-		sleep(1); // TESTING
+		//sleep(0.9); // TESTING
 	}
 	// close the client socket connection
 	close(cli_sock);
