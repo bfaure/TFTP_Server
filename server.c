@@ -76,7 +76,7 @@ typedef union
 } packet_t;
 
 // Creates a UDP-ready socket at the specified port number
-int open_tftp_listening_socket(int port);
+int open_listening_socket(int port);
 
 // Sends an error message to the client
 void send_error_packet(int err_num,char* err_msg,struct sockaddr_in* client_addr,socklen_t* addrlen);
@@ -112,7 +112,7 @@ int main(int argc, char ** argv)
 	int port_arg = atoi(argv[1]);
 
 	// open a listening connection at specified port 
-	int l_sock = open_tftp_listening_socket(port_arg);
+	int l_sock = open_listening_socket(port_arg);
 
 	if (l_sock<0)
 	{
@@ -164,7 +164,7 @@ int main(int argc, char ** argv)
 	return 1;
 }
 
-int open_tftp_listening_socket(int port)
+int open_listening_socket(int port)
 {
 	int sockfd = socket(AF_INET,SOCK_DGRAM,0); // create socket file descriptor
 	if (sockfd<0){  return -1;  } 			   // check for error
@@ -260,8 +260,6 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 	FILE *file_ptr;
 	if (strcasecmp(enc_mode,"netascii")==0) {  file_ptr = fopen(filename,"r");  }
 	else 									{  file_ptr = fopen(filename,"rb"); }
-
-	//FILE *file_ptr = fopen(filename,"rb");
 
 	// send as many data packets as we need for the full file (512 bytes at a time)
 	uint16_t block_num = 1;
