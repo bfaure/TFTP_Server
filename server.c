@@ -140,27 +140,37 @@ int main(int argc, char ** argv)
 		// increment request count
 		req_ct++; 
 
-		// check for invalid read 
-		if (n<0){  printf("ERROR: recvfrom returned <0 value\n");  }
-
-		// convert opcode from network to host byte order 
-		switch(ntohs(recv_packet.opcode))
+		// spawn child process to handle the request
+		if (fork()==0)
 		{
-			// RRQ
-			case 1:
-				handle_request(&recv_packet,&client_addr,(SLT*)&addrlen);
-				break;
 
-			// WRQ
-			case 2:
-				handle_request(&recv_packet,&client_addr,(SLT*)&addrlen);
-				break;
+			// check for invalid read 
+			if (n<0){  printf("ERROR: recvfrom returned <0 value\n");  }
 
-			default:
-				printf("Could not identify request!\n");
-				break;
+			// convert opcode from network to host byte order 
+			switch(ntohs(recv_packet.opcode))
+			{
+				// RRQ
+				case 1:
+					handle_request(&recv_packet,&client_addr,(SLT*)&addrlen);
+					break;
+
+				// WRQ
+				case 2:
+					handle_request(&recv_packet,&client_addr,(SLT*)&addrlen);
+					break;
+
+				default:
+					printf("Could not identify request!\n");
+					break;
+			}
+			exit(0); // close this (child) process
 		}
 	}
+
+	// close the listening socket
+	close(l_sock);
+
 	return 1;
 }
 
@@ -300,6 +310,8 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 
 		// if we are at the end of the file, exit the loop
 		if (n<512){  break;  }
+
+		sleep(1); // TESTING
 	}
 	// close the client socket connection
 	close(cli_sock);
