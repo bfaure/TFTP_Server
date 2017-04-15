@@ -81,13 +81,13 @@ int open_tftp_listening_socket(int port);
 void send_error_packet(int err_num,char* err_msg,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
 // Sends a single data packet to client 
-void send_data_packet(int cli_sock,int block_num,char *data,struct sockaddr_in* client_addr,socklen_t* addrlen);
+void send_data_packet(int cli_sock,int block_num,int block_size,char *data,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
 // Handles the sending of a specified file to client
-void send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen);
+int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen);
 
 // Waits for an ACK message from client 
-int wait_for_ack(cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen);
+int wait_for_ack(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
 // Searches the working directory for the specified filename
 int search_for_file(char *filename);
@@ -142,23 +142,22 @@ int main(int argc, char ** argv)
 		// check for invalid read 
 		if (n<0){  printf("ERROR: recvfrom returned <0 value\n");  }
 
-		//printf("Got request of length %d\n",n);
-
 		// convert opcode from network to host byte order 
 		switch(ntohs(recv_packet.opcode))
 		{
 			// RRQ
 			case 1:
-				//printf("RRQ\n");
 				handle_request(&recv_packet,&client_addr,(SLT*)&addrlen);
 				break;
 
 			// WRQ
 			case 2:
-				//printf("WRQ\n");
 				handle_request(&recv_packet,&client_addr,(SLT*)&addrlen);
 				break;
 
+			default:
+				printf("Could not identify request!\n");
+				break;
 		}
 	}
 	return 1;
@@ -214,7 +213,7 @@ void send_error_packet(int err_num, char* err_msg, struct sockaddr_in* client_ad
 	close(cli_sock);
 }
 
-void send_data_packet(int cli_sock,int block_num,char* data, struct sockaddr_in* client_addr, socklen_t* addrlen)
+void send_data_packet(int cli_sock,int block_num,int block_size,char* data, struct sockaddr_in* client_addr, socklen_t* addrlen)
 {
 	// create new packet_t 
 	packet_t d_packet;
@@ -226,10 +225,10 @@ void send_data_packet(int cli_sock,int block_num,char* data, struct sockaddr_in*
 	d_packet.data_t.block_num = htons(block_num);
 
 	// copy the data into the packet 
-	strcpy((char*)d_packet.data_t.data,data);
+	memcpy(d_packet.data_t.data,(uint8_t*)data,block_size);
 
 	// send the data packet to client
-	int did_send = sendto(cli_sock,&d_packet,strlen((char*)d_packet.data_t.data)+4,0,(SA*)client_addr,*addrlen);
+	int did_send = sendto(cli_sock,&d_packet,block_size+4,0,(SA*)client_addr,*addrlen);
 	if (did_send<0){  printf("ERROR: Could not send error message to client.\n");  }
 }
 
@@ -240,7 +239,7 @@ int wait_for_ack(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_a
 	return n;
 }
 
-void send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen)
+int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen)
 {
 	// open the requested file 
 	int fd = open(filename,O_RDONLY);
@@ -252,7 +251,7 @@ void send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrl
 
 	// set the socket options 
 	struct timeval tv;
-	tv.tv_sec = 5;
+	tv.tv_sec = 15;
 	tv.tv_usec = 0;
 	int did_set = setsockopt(cli_sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
 	if (did_set<0){  printf("ERROR: Could not set socket options.\n");  }
@@ -270,14 +269,32 @@ void send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrl
 		// read 512 bytes of the file into buffer 
 		int n = read(fd,buf,512);
 
+		// check to ensure we can read from file
+		if (n<0)
+		{
+			printf("ERROR: Could not read from file.\n");
+			return -1;
+		}
+
 		// zero-terminate message if at end of file
 		if (n<512){  buf[n] = 0;  }
 
 		// send the data segment to the client 
-		send_data_packet(cli_sock,block_num,buf,client_addr,addrlen);
+		send_data_packet(cli_sock,block_num,n,buf,client_addr,addrlen);
 
-		// wait for the ack message 
-		wait_for_ack(cli_sock,&recv_packet,client_addr,addrlen);
+		// wait until we get the correct ACK response
+		while(1)
+		{
+			// wait for the ack message 
+			wait_for_ack(cli_sock,&recv_packet,client_addr,addrlen);
+
+			// get the response block number
+			//int recv_block_num = ntohs(recv_packet.ack_t.block_num);
+
+			// get the response opcode
+			//int recv_opcode = ntohs(recv_packet.opcode);
+			break;
+		}
 
 		// increment the block number 
 		block_num++;
@@ -287,6 +304,7 @@ void send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrl
 	}
 	// close the client socket connection
 	close(cli_sock);
+	return block_num-1;
 }
 
 int search_for_file(char* filename)
@@ -347,14 +365,14 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 		{
 			// send the error code back to client
 			send_error_packet(1,"File Not Found",client_addr,addrlen);
-			//printf("Could not locate requested file!\n");
+			printf("\tCould not locate requested file!\n");
 		}
 
 		// proceed to begin copying the file back to the client
 		else
 		{
-			send_file(filename,client_addr,addrlen);
-			//printf("Sent requested file to client.\n");
+			int num_blocks = send_file(filename,client_addr,addrlen);
+			printf("\tSent requested file to client (%d blocks).\n",num_blocks);
 		}
 	}
 
@@ -363,5 +381,6 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 	{
 		// have not covered this yet
 		send_error_packet(0,"Not Yet Implemented",client_addr,addrlen);
+		printf("\tCanceled WRQ request.\n");
 	}
 }
