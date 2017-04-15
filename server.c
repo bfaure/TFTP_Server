@@ -30,6 +30,7 @@ command line and sends "Error 0: File Not Found" message back to clients.
 #include <netdb.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <string.h>
 
 typedef struct sockaddr SA;
 typedef socklen_t SLT;
@@ -81,10 +82,10 @@ int open_tftp_listening_socket(int port);
 void send_error_packet(int err_num,char* err_msg,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
 // Sends a single data packet to client 
-void send_data_packet(int cli_sock,int block_num,int block_size,char *data,struct sockaddr_in* client_addr,socklen_t* addrlen);
+void send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t *data,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
 // Handles the sending of a specified file to client
-int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen);
+int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen, char* enc_mode);
 
 // Waits for an ACK message from client 
 int wait_for_ack(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen);
@@ -213,7 +214,7 @@ void send_error_packet(int err_num, char* err_msg, struct sockaddr_in* client_ad
 	close(cli_sock);
 }
 
-void send_data_packet(int cli_sock,int block_num,int block_size,char* data, struct sockaddr_in* client_addr, socklen_t* addrlen)
+void send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t* data, struct sockaddr_in* client_addr, socklen_t* addrlen)
 {
 	// create new packet_t 
 	packet_t d_packet;
@@ -225,7 +226,7 @@ void send_data_packet(int cli_sock,int block_num,int block_size,char* data, stru
 	d_packet.data_t.block_num = htons(block_num);
 
 	// copy the data into the packet 
-	memcpy(d_packet.data_t.data,(uint8_t*)data,block_size);
+	memcpy(d_packet.data_t.data,data,block_size);
 
 	// send the data packet to client
 	int did_send = sendto(cli_sock,&d_packet,block_size+4,0,(SA*)client_addr,*addrlen);
@@ -234,17 +235,13 @@ void send_data_packet(int cli_sock,int block_num,int block_size,char* data, stru
 
 int wait_for_ack(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen)
 {
-	int n = recvfrom(cli_sock,recv_packet,sizeof(recv_packet),0,(SA*)client_addr,addrlen);
+	int n = recvfrom(cli_sock,recv_packet,sizeof(*recv_packet),0,(SA*)client_addr,addrlen);
 	if (n<0){  printf("ERROR: Could not receive message from client.\n");  }
 	return n;
 }
 
-int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen)
+int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen, char* enc_mode)
 {
-	// open the requested file 
-	int fd = open(filename,O_RDONLY);
-	if (fd<0){  printf("ERROR: Could not open file to send.\n");  }
-
 	// create socket connection to client to be used for transfer 
 	int cli_sock = socket(AF_INET,SOCK_DGRAM,0);
 	if (cli_sock<0){  printf("ERROR: Could not open transfer socket.\n");  }
@@ -259,15 +256,22 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 	// create packet to be hold ACK responses 
 	packet_t recv_packet;
 
+	// open the file differently depending on the specified encoding
+	FILE *file_ptr;
+	if (strcasecmp(enc_mode,"netascii")==0) {  file_ptr = fopen(filename,"r");  }
+	else 									{  file_ptr = fopen(filename,"rb"); }
+
+	//FILE *file_ptr = fopen(filename,"rb");
+
 	// send as many data packets as we need for the full file (512 bytes at a time)
-	int block_num = 1;
+	uint16_t block_num = 1;
 	while(1)
 	{
-		// create string buffer to hold file contents 
-		char* buf = malloc(sizeof(char)*512);
+		// create buffer to hold file contents 
+		uint8_t buf[512];
 
-		// read 512 bytes of the file into buffer 
-		int n = read(fd,buf,512);
+		// read 512 bytes into the buffer 
+		int n = fread(buf,1,512,file_ptr);
 
 		// check to ensure we can read from file
 		if (n<0)
@@ -275,9 +279,6 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 			printf("ERROR: Could not read from file.\n");
 			return -1;
 		}
-
-		// zero-terminate message if at end of file
-		if (n<512){  buf[n] = 0;  }
 
 		// send the data segment to the client 
 		send_data_packet(cli_sock,block_num,n,buf,client_addr,addrlen);
@@ -304,6 +305,10 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 	}
 	// close the client socket connection
 	close(cli_sock);
+
+	// close the local file we transferred
+	fclose(file_ptr);
+	
 	return block_num-1;
 }
 
@@ -371,7 +376,7 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 		// proceed to begin copying the file back to the client
 		else
 		{
-			int num_blocks = send_file(filename,client_addr,addrlen);
+			int num_blocks = send_file(filename,client_addr,addrlen,mode);
 			printf("\tSent requested file to client (%d blocks).\n",num_blocks);
 		}
 	}
