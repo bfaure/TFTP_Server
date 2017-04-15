@@ -1,14 +1,24 @@
 /*
- 
+ * server.c
+
  * Course Name: 14:332:456-Network Centric Programming
- * Assignment: TFTP Server (Part 1)
+ * Assignment: TFTP Server (Part 2)
  * Student Name: Brian Faure
 
-Simple implementation of a Trivial FTP server. Prints requests to terminal
-command line and sends "Error 0: File Not Found" message back to clients.
+Simple implementation of a Trivial FTP server. Prints all requests to terminal,
+safisfies RRQ requests and ignores all others. Uses a multi-process approach
+(fork()) to achieve concurrency and is able to effectively serve multiple RRQ 
+requests simulataneously. The search_for_file function that is used to check
+if the requested file exists (in the case of RRQ) takes an input 'allow_global'
+which, if set to 0 (default), will prevent any requests for filepaths that 
+include '/', as this would normally indicate the client is leaving the current 
+working directory. 
+
+command line and sends "Error 0: File Not Found" message back 
 
 */
 
+// All standard imports from csapp.c in prior project
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -30,8 +40,8 @@ command line and sends "Error 0: File Not Found" message back to clients.
 #include <netdb.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <string.h>
 
+// simplifying function calls
 typedef struct sockaddr SA;
 typedef socklen_t SLT;
 
@@ -75,23 +85,24 @@ typedef union
 
 } packet_t;
 
-// Creates a UDP-ready socket at the specified port number
+// Creates a UDP-ready socket at the specified port number, returns -1 on error
 int open_listening_socket(int port);
 
 // Sends an error message to the client
 void send_error_packet(int err_num,char* err_msg,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
-// Sends a single data packet to client 
-void send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t *data,struct sockaddr_in* client_addr,socklen_t* addrlen);
+// Sends a single data packet to client, returns -1 on error
+int send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t *data,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
-// Handles the sending of a specified file to client
+// Handles the sending of a specified file to client, returns -1 on error
 int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrlen, char* enc_mode);
 
-// Waits for an ACK message from client 
+// Waits for a message from client 
 int get_client_resp(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen);
 
-// Searches the working directory for the specified filename
-int search_for_file(char *filename);
+// Searches the working directory for the input filename, if allow_global is
+// 1, the filename is allowed to be anywhere on the sytstem
+int search_for_file(char *filename, int allow_global);
 
 // Handles RRQ or WRQ requests
 void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, socklen_t* addrlen);
@@ -113,7 +124,6 @@ int main(int argc, char ** argv)
 
 	// open a listening connection at specified port 
 	int l_sock = open_listening_socket(port_arg);
-
 	if (l_sock<0)
 	{
 		printf("ERROR: Could not open listening socket.\n");
@@ -124,17 +134,16 @@ int main(int argc, char ** argv)
 	struct sockaddr_in client_addr;
 	socklen_t addrlen = sizeof(client_addr);
 
-	int n,req_ct = 0; // 
-
-	// wait for incoming requests...
 	printf("\nListening at port %d:\n\n",port_arg);
-
+	
+	int n,req_ct = 0;	
+	// wait for incoming requests...
 	while(1)
 	{
-		// union containing likely message structure
+		// prep a packet object to hold a request
 		packet_t recv_packet;
 
-		// get message from socket 
+		// wait until a packet is received
 		n = recvfrom(l_sock,&recv_packet,sizeof(recv_packet),0,(SA*)&client_addr,(socklen_t *)&addrlen);
 
 		// increment request count
@@ -143,9 +152,12 @@ int main(int argc, char ** argv)
 		// spawn child process to handle the request
 		if (fork()==0)
 		{
-
 			// check for invalid read 
-			if (n<0){  printf("ERROR: recvfrom returned <0 value\n");  }
+			if (n<0)
+			{  
+				printf("WARNING: Received invalid request.\n");  
+				exit(0);
+			}
 
 			// convert opcode from network to host byte order 
 			switch(ntohs(recv_packet.opcode))
@@ -161,16 +173,14 @@ int main(int argc, char ** argv)
 					break;
 
 				default:
-					printf("Could not identify request!\n");
+					printf("WARNING: Could not identify request.\n");
 					break;
 			}
 			exit(0); // close this (child) process
 		}
 	}
-
 	// close the listening socket
 	close(l_sock);
-
 	return 1;
 }
 
@@ -209,10 +219,12 @@ void send_error_packet(int err_num, char* err_msg, struct sockaddr_in* client_ad
 	int cli_sock = socket(AF_INET,SOCK_DGRAM,0);
 	if (cli_sock<0){  printf("ERROR: Could not create client socket.\n");  }
 
-	// setting the options for the socket (socket timeout)
+	// creating struct to hold socket timeout options
 	struct timeval tv;
-	tv.tv_sec = 5;
+	tv.tv_sec = 5; // 5 seconds
 	tv.tv_usec = 0;
+
+	// set the socket timeout
 	int did_set = setsockopt(cli_sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
 	if (did_set<0){  printf("ERROR: Could not set socket options.\n");  }
 
@@ -224,7 +236,7 @@ void send_error_packet(int err_num, char* err_msg, struct sockaddr_in* client_ad
 	close(cli_sock);
 }
 
-void send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t* data, struct sockaddr_in* client_addr, socklen_t* addrlen)
+int send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t* data, struct sockaddr_in* client_addr, socklen_t* addrlen)
 {
 	// create new packet_t 
 	packet_t d_packet;
@@ -232,7 +244,7 @@ void send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t* da
 	// set the opcode to 3 (for data)
 	d_packet.opcode = htons(3);
 
-	// set the correct block number 
+	// set the block number 
 	d_packet.data_t.block_num = htons(block_num);
 
 	// copy the data into the packet 
@@ -240,7 +252,12 @@ void send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t* da
 
 	// send the data packet to client
 	int did_send = sendto(cli_sock,&d_packet,block_size+4,0,(SA*)client_addr,*addrlen);
-	if (did_send<0){  printf("ERROR: Could not send error message to client.\n");  }
+	if (did_send<0)
+	{  
+		printf("ERROR: Could not send error message to client.\n");  
+		return -1;
+	}
+	return 1;
 }
 
 int get_client_resp(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen)
@@ -253,14 +270,22 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 {
 	// create socket connection to client to be used for transfer 
 	int cli_sock = socket(AF_INET,SOCK_DGRAM,0);
-	if (cli_sock<0){  printf("ERROR: Could not open transfer socket.\n");  }
+	if (cli_sock<0)
+	{  
+		printf("ERROR: Could not open transfer socket.\n");  
+		return -1;
+	}
 
 	// set the socket options 
 	struct timeval tv;
 	tv.tv_sec = 15;
 	tv.tv_usec = 0;
 	int did_set = setsockopt(cli_sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
-	if (did_set<0){  printf("ERROR: Could not set socket options.\n");  }
+	if (did_set<0)
+	{  
+		printf("ERROR: Could not set socket options.\n");  
+		return -1;
+	}
 
 	// create packet to be hold ACK responses 
 	packet_t recv_packet;
@@ -295,6 +320,7 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 		{
 			// send the data segment to the client 
 			send_data_packet(cli_sock,block_num,n,buf,client_addr,addrlen);
+
 			num_attempts++;
 		
 			// wait for the ack message 
@@ -340,7 +366,7 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 		// if we are at the end of the file, exit the loop
 		if (n<512){  break;  }
 
-		sleep(2); // TESTING
+		//sleep(2); // TESTING
 	}
 	// close the client socket connection
 	close(cli_sock);
@@ -349,16 +375,30 @@ int send_file(char* filename, struct sockaddr_in* client_addr, socklen_t* addrle
 	return block_num-1;
 }
 
-int search_for_file(char* filename)
+int search_for_file(char* filename, int allow_global)
 {
-	int fd = open(filename,O_RDONLY);
+	// if only allowed to access the immediate working directory 
+	if (!allow_global)
+	{
+		// check if the requested filename contains any '/' characters 
+		if (strchr(filename,'/')!=NULL)
+		{
+			// not allowed to leave current directory, return error
+			return -1;
+		}
+	}
+
+	// attempt to open the requested file
+	int fd = open(filename,O_RDONLY); 
 	if (fd<0)
 	{
+		// not able to locate the file
 		close(fd);
 		return 0;
 	}
 	else
-	{
+	{	
+		// able to locate the file
 		close(fd);
 		return 1;
 	}
@@ -399,24 +439,31 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 	// if the request is RRQ
 	if (strcmp(req_type,"RRQ")==0)
 	{
-		// check if the requested file exists
-		int f_exists = search_for_file(filename);
+		// check if the requested file exists in the working directory
+		int f_exists = search_for_file(filename,0);
 
 		// if the requested file is not in the directory
 		if (f_exists==0)
 		{
 			// send the error code back to client
 			send_error_packet(1,"File Not Found",client_addr,addrlen);
-			printf("\tCould not locate file (%s)\n",filename);
+			printf("\tCould not locate file \'%s\'\n",filename);
+			return;
+		}
+
+		// if the requested file was not allowed to be accessed
+		if (f_exists==-1)
+		{
+			// send the error code back to client
+			send_error_packet(2,"Not Allowed",client_addr,addrlen);
+			printf("\tClient denied access to \'%s\'\n",filename);
+			return;	
 		}
 
 		// proceed to begin copying the file back to the client
-		else
-		{
-			int num_blocks = send_file(filename,client_addr,addrlen,mode);
-			if (num_blocks<0){  return;  }
-			printf("\tSent %s file to client (%d blocks).\n",filename,num_blocks);
-		}
+		int num_blocks = send_file(filename,client_addr,addrlen,mode);
+		if (num_blocks<0){  return;  }
+		printf("\tSent \'%s\' to client in %d block(s)\n",filename,num_blocks);
 	}
 
 	// if the request is WRQ
@@ -424,6 +471,6 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 	{
 		// have not covered this yet
 		send_error_packet(0,"Not Yet Implemented",client_addr,addrlen);
-		printf("\tCanceled WRQ request.\n");
+		printf("\tCanceled WRQ request\n");
 	}
 }
