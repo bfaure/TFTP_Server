@@ -2,7 +2,7 @@
  * server.c
 
  * Course Name: 14:332:456-Network Centric Programming
- * Assignment: TFTP Server (Part 2)
+ * Assignment: TFTP Server (Part 2 - Concurrent)
  * Student Name: Brian Faure
 
 Simple implementation of a Trivial FTP server. Prints all requests to terminal,
