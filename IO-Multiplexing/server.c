@@ -659,7 +659,7 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 		{
 			// send the error code back to client
 			send_error_packet(1,"File Not Found",client_addr,addrlen);
-			printf("\tCould not locate file \'%s\'\n",filename);
+			printf("Could not locate file \'%s\'\n",filename);
 			return;
 		}
 
@@ -668,7 +668,7 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 		{
 			// send the error code back to client
 			send_error_packet(2,"Not Allowed",client_addr,addrlen);
-			printf("\tClient denied access to \'%s\'\n",filename);
+			printf("Client denied access to \'%s\'\n",filename);
 			return;	
 		}
 
@@ -681,6 +681,6 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 	{
 		// have not covered this yet
 		send_error_packet(0,"Not Yet Implemented",client_addr,addrlen);
-		printf("\tCanceled WRQ request\n");
+		printf("Canceled WRQ request\n");
 	}
 }
