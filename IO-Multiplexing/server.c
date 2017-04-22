@@ -6,15 +6,19 @@
  * Student Name: Brian Faure
 
 Simple implementation of a Trivial FTP server. Prints all requests to terminal,
-safisfies RRQ requests and ignores all others. Uses a multi-process approach
-(fork()) to achieve concurrency and is able to effectively serve multiple RRQ 
-requests simulataneously. The search_for_file function that is used to check
-if the requested file exists (in the case of RRQ) takes an input 'allow_global'
-which, if set to 0 (default), will prevent any requests for filepaths that 
-include '/', as this would normally indicate the client is leaving the current 
-working directory. 
+safisfies RRQ requests and ignores all others. Uses IO multiplexing in the form
+of the select() function to achieve effective concurrency, allowing for serving
+multiple clients at a time. By default, any RRQ requests whose filenames contain
+'/' will be denied as they may indicate the client is attempting to leave the 
+current working directory (this feature can be disabled by changing the 
+'allow_global' input of search_for_file to 1.
 
-command line and sends "Error 0: File Not Found" message back 
+When RRQ requests are receieved, I parse out all necessary information, initialize 
+the first response packet, open a new transfer_t on the transfers list (just take
+up a new open spot on the list in reality), and send the first 512 bytes of the file 
+back to the client. All active items in the transfers list will have a chance of being
+serviced on each iteration of the main event loop so long as they have information 
+ready to be read from their socket.
 
 */
 
@@ -83,35 +87,34 @@ typedef union
         uint16_t error_code; // 2 byte error code 
         uint8_t  error_msg[512]; // string errmsg, 1 null byte
     } error_t;
-
 } packet_t;
 
 // holds information pertinant to a pending transfer, allows for transfers to be put
 // to 'sleep' while their file descriptors are not ready for reading or writing
 typedef struct
 {
-	int socket_fd; // file descriptor used for transfer (socket interface)
-	uint16_t block_num; // block index of current step of tranfer
-	FILE* fp; // local disk file pointer
-	int active; // 1 if this tranfer_t is being used, 0 if not
-	struct sockaddr_in* client_addr;
-	socklen_t* addrlen;
-	int final_transfer; // 1 if the final block was transferred
-	char filename[200]; // name of file being transferred
-	uint8_t cur_block[512]; // current block being transferred
-	int block_attempts; // number of attempts to send current block
+	int socket_fd; 					// file descriptor used for transfer (socket interface)
+	uint16_t block_num; 			// block index of current step of tranfer
+	FILE* fp; 						// local disk file pointer
+	int active; 					// 1 if this tranfer_t is being used, 0 if not
+	struct sockaddr_in* client_addr;// client info
+	socklen_t* addrlen; 			// client info
+	int transfer_size; 				// size (bytes) of last transferred data
+	char filename[200]; 			// name of file being transferred
+	uint8_t cur_block[512]; 		// current block being transferred
+	int block_attempts; 			// number of attempts to send current block
 } transfer_t;
 
-fd_set read_fds; // used to maintain opened sockets for I/O multiplexing
+fd_set read_fds;           // used to maintain opened sockets for I/O multiplexing
 transfer_t transfers[100]; // holds open transfer information (1 active per open socket)
 
-// Closes the transfer at index 't' of transfers array
+// Evicts the connection at index 't' of the transfers list
 void close_transfer(int t);
 
-// Initializes all 100 spots in the transfers array
+// Initializes all 100 spots in the transfers array to open
 void init_transfers();
 
-// Returns the index of a transfer whose socket is ready to be read
+// Gets an index in the transfers array where the corresponding elements socket is ready to be read
 int get_ready_transfer();
 
 // Returns the highest socket fd in the transfers array 
@@ -121,11 +124,12 @@ int max_transfer_fd();
 // if no open spots are available returns -1
 int open_transfer(int socket_fd, FILE* fp, struct sockaddr_in* client_addr, socklen_t* addrlen, char* filename);
 
-// Picks up where it (or start_transfer) left off, sending the next block
-// of a file (RRQ). If this is the last block, the transfer is closed.
+// Reads the response from client, if correct ACK, sends next block (or terminates
+// if transfer complete), if ACK is for block sent on the step before the last step
+// resend the prior block. Otherwise terminate connection due to error.
 void resume_transfer(int t);
 
-// Opens a transfer and sends the first block to the client (RRQ)
+// Sends the first 512 byte block of data to client
 int start_transfer(char *filename, struct sockaddr_in* client_addr, socklen_t* addrlen, char* enc_mode);
 
 // Creates a UDP-ready socket at the specified port number, returns -1 on error
@@ -150,18 +154,6 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 
 ///////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////
-
-void set_all_active_fds(int l_sock)
-{
-	FD_SET(l_sock,&read_fds);
-	for (int i=0; i<100; i++)
-	{
-		if (transfers[i].active)
-		{
-			FD_SET(transfers[i].socket_fd,&read_fds);
-		}
-	}
-}
 
 int main(int argc, char ** argv)
 {
@@ -197,10 +189,11 @@ int main(int argc, char ** argv)
 	// wait for incoming requests...
 	while(1)
 	{
-		// FD_SET the listening socket and all fds pertaining to active
-		// sockets (fds taken from transfers array, only 'active' members)
-		set_all_active_fds(l_sock); 
-
+		// FD_SET the listening socket
+		FD_SET(l_sock,&read_fds);
+		// FD_SET all active socket fds
+		for (int i=0; i<100; i++){ if (transfers[i].active){ FD_SET(transfers[i].socket_fd,&read_fds);}}
+		
 		// get the maximum file descriptor
 		nfds = max_transfer_fd();
 		if (l_sock>nfds){  nfds=l_sock+1;  }
@@ -229,13 +222,14 @@ int main(int argc, char ** argv)
 			packet_t recv_packet;
 
 			// read the data from the client
-			int n = recvfrom(l_sock,&recv_packet,sizeof(recv_packet),0,(SA*)&client_addr,(socklen_t*)&addrlen);
+			int n = recvfrom(l_sock,&recv_packet,sizeof(recv_packet),0,
+				(SA*)&client_addr,(socklen_t*)&addrlen);
 
 			// check for errors on read
 			if (n<0)
 			{
 				printf("WARNING: Received invalid request.\n");
-				//break;
+				goto SERVICE_OPEN_CLIENTS; // disregard this request
 			}
 
 			// if a RRQ or WRQ request 
@@ -245,22 +239,271 @@ int main(int argc, char ** argv)
 				printf("WARNING: Could not identify request.\n");
 		}
 
-		// if there are still some sockets waiting to be serviced
-		if (ready>0)
+		SERVICE_OPEN_CLIENTS:
+		// if there are still some sockets waiting to be serviced,
+		for(int i=0; i<ready; i++)
 		{
-			// service the amount of sockets that are ready
-			for(int i=0; i<ready; i++)
-			{
-				// get a transfer with a ready socket
-				int selected_transfer_idx = get_ready_transfer();
-				if (selected_transfer_idx==-1){  break;  }
-				resume_transfer(selected_transfer_idx);
-			}
+			// get a transfer with a ready socket
+			int selected_transfer_idx = get_ready_transfer();
+			if (selected_transfer_idx==-1){  break;  }
+			resume_transfer(selected_transfer_idx);
 		}
 	}
 	// close the listening socket
 	close(l_sock);
 	return 1;
+}
+
+void close_transfer(int t)
+{
+	if (t!=-1)
+	{
+		FD_CLR(transfers[t].socket_fd,&read_fds);
+		transfers[t].active = 0;
+	}
+}
+
+void init_transfers()
+{
+	for (int i=0; i<100; i++)
+	{
+		close_transfer(i);
+	}
+}
+
+int get_ready_transfer()
+{
+	for (int i=0; i<100; i++)
+	{
+		if (transfers[i].active && FD_ISSET(transfers[i].socket_fd,&read_fds))
+		{
+			FD_CLR(transfers[i].socket_fd,&read_fds);
+			return i;
+		}
+	}
+	return -1;
+}
+
+int max_transfer_fd()
+{
+	int max_fd = -1;
+	for (int i=0; i<100; i++)
+	{
+		if (transfers[i].active && (transfers[i].socket_fd>max_fd))
+		{
+			max_fd = transfers[i].socket_fd;
+		}
+	}
+	return max_fd;
+}
+
+int open_transfer(int socket_fd, FILE* fp, struct sockaddr_in* client_addr, socklen_t* addrlen, char* filename)
+{
+	// iterate over all possible slots in which to place the new client
+	for (int i=0; i<100; i++)
+	{
+		// if this slot is open
+		if (transfers[i].active==0)
+		{
+			transfers[i].socket_fd = socket_fd;
+			transfers[i].block_num = 0;
+			transfers[i].fp = fp;
+			transfers[i].active = 1;
+			transfers[i].client_addr = client_addr;
+			transfers[i].addrlen = addrlen;
+			transfers[i].transfer_size = -1;
+			transfers[i].block_attempts = 0;
+			strcpy(transfers[i].filename,filename);
+			return i;
+		}
+	}
+	printf("WARNING: Number of transfer bays maxed out.\n");
+	return -1;
+}
+
+void resume_transfer(int t)
+{
+	//sleep(1); // TESTING
+
+	// create packet to hold ACK responses
+	packet_t recv_packet;
+
+	int last_block_num = transfers[t].block_num;
+	int ack_legit = 0;
+
+	int resp_size = get_client_resp(transfers[t].socket_fd,&recv_packet,
+		transfers[t].client_addr,transfers[t].addrlen);
+
+	// if we got a response
+	if (resp_size>0)
+	{  
+		// check if the received packet was an ACK
+		if (ntohs(recv_packet.opcode)==4)
+		{
+			// check if the received block number was correct
+			if (ntohs(recv_packet.ack_t.block_num)==last_block_num)
+			{
+				// go on to the next packet (or exit if transfer complete)
+				ack_legit = 1;
+
+				// check if this was the last transfer
+				if (transfers[t].transfer_size<512)
+				{
+					// prep string to hold ip address
+					char ip_address[128];
+					inet_ntop(AF_INET, &(transfers[t].client_addr->sin_addr), ip_address, 128);
+
+					// prep string to hold port number 
+					char port_num[12];
+					sprintf(port_num,"%d",ntohs(transfers[t].client_addr->sin_port));
+
+					// print transfer confirmation to stdout
+					printf("Sent \'%s\' to %s:%s in %d block(s)\n",transfers[t].filename,
+						ip_address,port_num,last_block_num);
+
+					goto RESUME_CLEANUP;
+				}
+			}
+			else
+			{
+				// if we need to re-send the last block
+				if (ntohs(recv_packet.ack_t.block_num)==last_block_num-1)
+				{	
+					// if we have already tried sending this block 3 times, cut off
+					if (transfers[t].block_attempts>3)
+						goto RESUME_CLEANUP;
+
+					// try sending block again
+					send_data_packet(transfers[t].socket_fd,last_block_num,
+						transfers[t].transfer_size,transfers[t].cur_block,
+						transfers[t].client_addr,transfers[t].addrlen);
+					transfers[t].block_attempts++;
+					return;
+				}
+				// if the block number wasn't the last or the one prior to the last
+				else
+				{
+					printf("ERROR: Client ACK block number off >2.\n");
+					goto RESUME_CLEANUP;
+				}
+			}
+		}
+		// check if the received packet was an ERROR
+		if (ntohs(recv_packet.opcode)==5)
+		{
+			// terminate execution upon receiving ERROR message
+			printf("NOTICE: Transfer canceled by client.\n");
+			goto RESUME_CLEANUP;
+		}
+	}
+	else
+	{
+		printf("ERROR: Invalid message from client.\n");
+		goto RESUME_CLEANUP;
+	}
+
+	// if the client acknowledged the last block sent
+	if (ack_legit)
+	{
+		int next_block_num = last_block_num+1;
+		transfers[t].block_num = next_block_num;
+
+		uint8_t buf[512];
+
+		int n = fread(buf,1,512,transfers[t].fp);
+
+		if (n<0)
+		{
+			printf("ERROR: Could not read from file.\n");
+			goto RESUME_CLEANUP;
+		}
+
+		// send this block
+		send_data_packet(transfers[t].socket_fd,next_block_num,n,buf,
+			transfers[t].client_addr,transfers[t].addrlen);
+
+		// set the true size of the last block transferred
+		transfers[t].transfer_size = n;
+
+		// this is the first time trying to send this block
+		transfers[t].block_attempts = 1;
+
+		// copy the current block into the transfer struct in case we need to re-send
+		memcpy(transfers[t].cur_block,buf,n);
+		return;
+	}
+
+	RESUME_CLEANUP:
+	close(transfers[t].socket_fd); // close the open socket
+	fclose(transfers[t].fp); // close the FILE pointer
+	close_transfer(t); // de-activate the transfer slot
+}
+
+int start_transfer(char *filename, struct sockaddr_in* client_addr, socklen_t* addrlen, char* enc_mode)
+{
+	int t,cli_sock = -1; // initialize variables
+
+	// create socket connection to client to be used for transfer 
+	cli_sock = socket(AF_INET,SOCK_DGRAM,0);
+	if (cli_sock<0)
+	{  
+		printf("ERROR: Could not open transfer socket.\n");  
+		goto CLEANUP;
+	}
+
+	// set the socket options 
+	struct timeval tv;
+	tv.tv_sec = 5;
+	tv.tv_usec = 0;
+	int did_set = setsockopt(cli_sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
+	if (did_set<0)
+	{  
+		printf("ERROR: Could not set socket options.\n");  
+		goto CLEANUP;
+	}
+
+	// open the file differently depending on the specified encoding
+	FILE *file_ptr;
+	if (strcasecmp(enc_mode,"netascii")==0) {  file_ptr = fopen(filename,"r");  }
+	else 									{  file_ptr = fopen(filename,"rb"); }
+
+	// try to occupy a transfer bay (index) in the list of 100 transfers
+	t = open_transfer(cli_sock,file_ptr,client_addr,addrlen,filename);
+	if (t==-1)
+	{  
+		printf("ERROR: Could not open a new transfer.\n");  
+		goto CLEANUP;
+	}
+
+	uint16_t block_num = 1;
+	transfers[t].block_num = block_num;
+
+	uint8_t buf[512];
+	int n = fread(buf,1,512,transfers[t].fp);
+	if (n<0)
+	{
+		printf("ERROR: Could not read from file.\n");
+		goto CLEANUP;
+	}
+
+	// send this block
+	send_data_packet(transfers[t].socket_fd,block_num,n,buf,
+		transfers[t].client_addr,transfers[t].addrlen);
+
+	// let ourselves know that this was the final block of the transfer
+	transfers[t].transfer_size = n;
+
+	// copy the current block into the transfer struct (in case resend req.)
+	memcpy(transfers[t].cur_block,buf,n);
+
+	// first attempt to send this block
+	transfers[t].block_attempts = 1; 
+	return 1;
+
+	CLEANUP:
+	close(cli_sock);
+	close_transfer(t);
+	return -1;
 }
 
 int open_listening_socket(int port)
@@ -340,8 +583,8 @@ int send_data_packet(int cli_sock,uint16_t block_num,int block_size,uint8_t* dat
 
 int get_client_resp(int cli_sock,packet_t *recv_packet,struct sockaddr_in* client_addr,socklen_t* addrlen)
 {
-	int n = recvfrom(cli_sock,recv_packet,sizeof(*recv_packet),0,(SA*)client_addr,addrlen);
-	return n;
+	return recvfrom(cli_sock,recv_packet,sizeof(*recv_packet),
+		0,(SA*)client_addr,addrlen);
 }
 
 int search_for_file(char* filename, int allow_global)
@@ -370,152 +613,6 @@ int search_for_file(char* filename, int allow_global)
 		// able to locate the file
 		close(fd);
 		return 1;
-	}
-}
-
-int start_transfer(char *filename, struct sockaddr_in* client_addr, socklen_t* addrlen, char* enc_mode)
-{
-	int t,cli_sock = -1; // initialize variables
-
-	// create socket connection to client to be used for transfer 
-	cli_sock = socket(AF_INET,SOCK_DGRAM,0);
-	if (cli_sock<0)
-	{  
-		printf("ERROR: Could not open transfer socket.\n");  
-		goto CLEANUP;
-	}
-
-	// set the socket options 
-	struct timeval tv;
-	tv.tv_sec = 5;
-	tv.tv_usec = 0;
-	int did_set = setsockopt(cli_sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv));
-	if (did_set<0)
-	{  
-		printf("ERROR: Could not set socket options.\n");  
-		goto CLEANUP;
-	}
-
-	// open the file differently depending on the specified encoding
-	FILE *file_ptr;
-	if (strcasecmp(enc_mode,"netascii")==0) {  file_ptr = fopen(filename,"r");  }
-	else 									{  file_ptr = fopen(filename,"rb"); }
-
-	// try to occupy a transfer bay (index) in the list of 100 transfers
-	t = open_transfer(cli_sock,file_ptr,client_addr,addrlen,filename);
-	if (t==-1)
-	{  
-		printf("ERROR: Could not open a new transfer.\n");  
-		goto CLEANUP;
-	}
-
-	uint16_t block_num = 1;
-	transfers[t].block_num = block_num;
-
-	uint8_t buf[512];
-	int n = fread(buf,1,512,transfers[t].fp);
-	if (n<0)
-	{
-		printf("ERROR: Could not read from file.\n");
-		goto CLEANUP;
-	}
-
-	// send this block
-	send_data_packet(transfers[t].socket_fd,block_num,n,buf,transfers[t].client_addr,transfers[t].addrlen);
-
-	// let ourselves know that this was the final block of the transfer
-	if (n<512){  transfers[t].final_transfer=1;  }
-
-	// first attempt to send this block
-	transfers[t].block_attempts = 1; 
-	return 1;
-
-	CLEANUP:
-	close(cli_sock);
-	close_transfer(t);
-	return -1;
-}
-
-void resume_transfer(int t)
-{
-	sleep(1); // TESTING
-
-	// create packet to hold ACK responses
-	packet_t recv_packet;
-
-	int last_block_num = transfers[t].block_num;
-	int ack_legit = 0;
-
-	int resp_size = get_client_resp(transfers[t].socket_fd,&recv_packet,transfers[t].client_addr,transfers[t].addrlen);
-	// if we got a response
-	if (resp_size>0)
-	{  
-		// check if the received packet was an ACK
-		if (ntohs(recv_packet.opcode)==4)
-		{
-			// check if the received block number was correct
-			if (ntohs(recv_packet.ack_t.block_num)==last_block_num)
-			{
-				// go on to the next packet (or exit if transfer complete)
-				ack_legit = 1;
-
-				// check if this was the last transfer
-				if (transfers[t].final_transfer==1)
-				{
-					printf("\tSent \'%s\' to client in %d block(s)\n",transfers[t].filename,last_block_num);
-
-					// close socket and file pointer
-					close(transfers[t].socket_fd);
-					fclose(transfers[t].fp);
-
-					// close the transfer bay 
-					close_transfer(t);
-					return;
-				}
-			}
-			else
-			{
-				printf("ERROR: Client sent incorrect ACK block number.\n");
-			}
-		}
-		// check if the received packet was an ERROR
-		if (ntohs(recv_packet.opcode)==5)
-		{
-			// terminate execution upon receiving ERROR message
-			close(transfers[t].socket_fd);
-			fclose(transfers[t].fp);
-			close_transfer(t);
-			printf("NOTICE: Transfer canceled by client.\n");
-			return;
-		}
-	}
-	else
-	{
-		printf("WARNING: resume_transfer()\n");
-		return;
-	}
-
-	// if the client acknowledged the last block sent
-	if (ack_legit)
-	{
-		int next_block_num = last_block_num+1;
-		transfers[t].block_num = next_block_num;
-
-		uint8_t buf[512];
-
-		int n = fread(buf,1,512,transfers[t].fp);
-
-		if (n<0)
-		{
-			printf("ERROR: Could not read from file.\n");
-			return;
-		}
-
-		// send this block
-		send_data_packet(transfers[t].socket_fd,next_block_num,n,buf,transfers[t].client_addr,transfers[t].addrlen);
-
-		// let ourselves know that this was the final block of the transfer
-		if (n<512){  transfers[t].final_transfer=1;  }
 	}
 }
 
@@ -548,7 +645,7 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 	sprintf(port_num,"%d",ntohs(client_addr->sin_port));
 
 	// prep overall string to print
-	sprintf(print_str,"%s %s %s from %s:%s\n",req_type,filename,mode,ip_address,port_num);
+	sprintf(print_str,"%s  \'%s\' %s from %s:%s\n",req_type,filename,mode,ip_address,port_num);
 	printf("%s",print_str); // print out request info 
 
 	// if the request is RRQ
@@ -586,70 +683,4 @@ void handle_request(packet_t *recv_packet, struct sockaddr_in* client_addr, sock
 		send_error_packet(0,"Not Yet Implemented",client_addr,addrlen);
 		printf("\tCanceled WRQ request\n");
 	}
-}
-
-void close_transfer(int t)
-{
-	if (t!=-1)
-	{
-		FD_CLR(transfers[t].socket_fd,&read_fds);
-		transfers[t].active = 0;
-	}
-}
-
-void init_transfers()
-{
-	for (int i=0; i<100; i++)
-	{
-		close_transfer(i);
-	}
-}
-
-int open_transfer(int socket_fd, FILE* fp, struct sockaddr_in* client_addr, socklen_t* addrlen, char* filename)
-{
-	for (int i=0; i<100; i++)
-	{
-		if (transfers[i].active==0)
-		{
-			FD_SET(socket_fd,&read_fds);
-			transfers[i].socket_fd = socket_fd;
-			transfers[i].block_num = 0;
-			transfers[i].fp = fp;
-			transfers[i].active = 1;
-			transfers[i].client_addr = client_addr;
-			transfers[i].addrlen = addrlen;
-			transfers[i].final_transfer = 0;
-			transfers[i].block_attempts = 0;
-			strcpy(transfers[i].filename,filename);
-			return i;
-		}
-	}
-	printf("WARNING: Number of transfer bays maxed out.\n");
-	return -1;
-}
-
-int max_transfer_fd()
-{
-	int max_fd = -1;
-	for (int i=0; i<100; i++)
-	{
-		if (transfers[i].active && (transfers[i].socket_fd>max_fd))
-		{
-			max_fd = transfers[i].socket_fd;
-		}
-	}
-	return max_fd;
-}
-
-int get_ready_transfer()
-{
-	for (int i=0; i<100; i++)
-	{
-		if (transfers[i].active && FD_ISSET(transfers[i].socket_fd,&read_fds))
-		{
-			FD_CLR(transfers[i].socket_fd,&read_fds);
-			return i;
-		}
-	}
-	return -1;
 }
